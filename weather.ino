@@ -1,6 +1,6 @@
 /*
  * WioTerminal bulb weather board
- * 2020/5/18 @103yen
+ * 2020/5/19 @103yen
  */
  
 #include <string.h>
@@ -59,6 +59,14 @@ TFT_eSPI tft;
 TFT_eSprite sprite1 = TFT_eSprite(&tft);
 int weather;
 
+/*
+ * usart_ll_thread_idにアクセスするため、Arduino/libraries/esp-at-lib-develop/src/esp_ll_arduino.cppの
+ * 90行目を以下のように変更する(staticを取る)
+ * 
+ * esp_sys_thread_t usart_ll_thread_id;
+ */
+extern esp_sys_thread_t usart_ll_thread_id;
+
 int parseWeatherStr(const char* telop) {
   int returncode = FORECAST_NULL;
   
@@ -102,14 +110,15 @@ int getWeather() {
   StaticJsonDocument<512> doc;
   DeserializationError error;
   
-  tft.println("Start WiFi Connecting");
+  tft.println("Begin WiFi");
+  vTaskPrioritySet(usart_ll_thread_id, ESP_SYS_THREAD_PRIO - 1);
   
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   while (WiFi.status() != WL_CONNECTED) {
       delay(100);
   }
-  tft.println("WiFi Connected");
+  tft.println("Connect " API_SERVER);
   
   if (!client.connect(API_SERVER, 80)) {
       tft.println("Connection failed!");
@@ -117,19 +126,23 @@ int getWeather() {
       goto EXIT;
   }
 
+  tft.println("Request " API_RESOURCE);
   // Make a HTTP request:
   client.println("GET " API_RESOURCE " HTTP/1.0");
   client.println("Host: " API_SERVER);
   client.println("Connection: close");
   client.println();
 
+  tft.println("Connected");
   while (client.connected()) {
+    delay(1);
     String line = client.readStringUntil('\n');
     if (line == "\r") {
       // end of header
       break;
     }
   }
+  tft.println("Header end");
 
   // JSONのうち残す項目
   filter["forecasts"][0]["dateLabel"] = true;
@@ -151,9 +164,10 @@ int getWeather() {
 EXIT:
   client.stop();
   WiFi.disconnect();
-
-  tft.println(returncode, HEX);
   
+  vTaskPrioritySet(usart_ll_thread_id, ESP_SYS_THREAD_PRIO - 2);
+  
+  tft.println(returncode, HEX);  
   return returncode;
 }
 
@@ -222,6 +236,7 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
   
   weather = getWeather();
+  //weather = FORECAST_FIRST_HARE | FORECAST_NOCHI | FORECAST_SECOND_KUMORI;
 }
 
 void loop() {
