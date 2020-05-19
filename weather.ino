@@ -95,9 +95,9 @@ int parseWeatherStr(const char* telop) {
   char* yuki2 = strstr(telop + 1, u8"雪");
   
   if(hare2 != NULL)         returncode |= FORECAST_SECOND_HARE;
-  else if(kumori1 != NULL)  returncode |= FORECAST_SECOND_KUMORI;
-  else if(ame1 != NULL)     returncode |= FORECAST_SECOND_AME;
-  else if(yuki1 != NULL)    returncode |= FORECAST_SECOND_YUKI;
+  else if(kumori2 != NULL)  returncode |= FORECAST_SECOND_KUMORI;
+  else if(ame2 != NULL)     returncode |= FORECAST_SECOND_AME;
+  else if(yuki2 != NULL)    returncode |= FORECAST_SECOND_YUKI;
 
   return returncode;
 }
@@ -109,7 +109,8 @@ int getWeather() {
   StaticJsonDocument<64> filter;
   StaticJsonDocument<512> doc;
   DeserializationError error;
-  
+
+  tft.setCursor(0, 0);
   tft.println("Begin WiFi");
   vTaskPrioritySet(usart_ll_thread_id, ESP_SYS_THREAD_PRIO - 1);
   
@@ -235,11 +236,13 @@ void setup() {
   tft.setBitmapColor(TFT_LAMP, TFT_BLACK);
   tft.fillScreen(TFT_BLACK);
   
-  weather = getWeather();
+  //weather = getWeather();
   //weather = FORECAST_FIRST_HARE | FORECAST_NOCHI | FORECAST_SECOND_KUMORI;
 }
 
 void loop() {
+  weather = getWeather();
+  for(int i=0;i<10;i++){
   drawImage(WEATHER_ASUNOTENKI);
   delay(1500);
 
@@ -254,5 +257,6 @@ void loop() {
   if(weather & FORECAST_MASK_SECOND) {
     drawWeather(weather & FORECAST_MASK_SECOND);
     delay(1500);
+  }
   }
 }
