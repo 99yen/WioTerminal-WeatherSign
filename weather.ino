@@ -1,8 +1,8 @@
 /*
- * WioTerminal bulb weather board
+ * WioTerminal WeatherSign
  * 2020/5/19 @103yen
  */
- 
+
 #include <string.h>
 #include <TFT_eSPI.h>
 #include <AtWiFi.h>
@@ -12,17 +12,33 @@
 
 #include "weather_graphic.h"
 
+/*
+ * usart_ll_thread_idにアクセスするため、Arduino/libraries/esp-at-lib-develop/src/esp_ll_arduino.cppの
+ * 90行目を以下のように変更する(staticを取る)
+ * 
+ * esp_sys_thread_t usart_ll_thread_id;
+ */
+extern esp_sys_thread_t usart_ll_thread_id;
+
 // WiFi設定
 #define WIFI_SSID "SSID"
 #define WIFI_PASSWORD "PASSWORD"
 
 // Livedoor天気情報API
-// http://weather.livedoor.com/weather_hacks/webservice
+// 解説 http://weather.livedoor.com/weather_hacks/webservice
+// city=以降が地域ID
+// ID一覧 http://weather.livedoor.com/forecast/rss/primary_area.xml
+#define API_RESOURCE "/forecast/webservice/json/v1?city=130010"
 #define API_SERVER "weather.livedoor.com"
 
-// city=以降が都市ID
-// http://weather.livedoor.com/forecast/rss/primary_area.xml
-#define API_RESOURCE "/forecast/webservice/json/v1?city=130010"
+// 更新間隔(ms)
+#define UPDATE_PERIOD_MS (1UL * 60 * 60 * 1000)
+#define UPDATE_RETRY 3
+
+// タイムアウト
+#define CLIENT_TIMEOUT 10000
+#define AP_TIMEOUT 20000
+#define HTTP_HEADER_TIMEOUT 10000
 
 // 描画位置
 #define OFFSET_X 25
@@ -33,43 +49,51 @@
 // ランプ描画色
 #define TFT_LAMP 0xFBE4
 
-// APIから取得した天気予報の種類
-#define FORECAST_NULL 0x0000
-#define FORECAST_FIRST_HARE 0x1000
-#define FORECAST_FIRST_KUMORI 0x2000
-#define FORECAST_FIRST_AME 0x4000
-#define FORECAST_FIRST_YUKI 0x8000
+// WiFi通信スレッド制御
+#define WIFI_THREAD_RESTORE_PRIOTIRY()    vTaskPrioritySet(usart_ll_thread_id, ESP_SYS_THREAD_PRIO - 1)
+#define WIFI_THREAD_LOW_PRIORITY()        vTaskPrioritySet(usart_ll_thread_id, ESP_SYS_THREAD_PRIO - 2)
 
-#define FORECAST_NOCHI 0x0100
-#define FORECAST_TOKIDOKI 0x0200
+// 戻り値
+#define WEATHER_SUCCESS 0
+#define WEATHER_AP_ERROR -1
+#define WEATHER_CONNECTION_ERROR -2
+#define WEATHER_TIMEOUT -3
+#define WEATHER_JSON_ERROR -4
+#define WEATHER_PARSE_ERROR -5
 
-#define FORECAST_SECOND_HARE 0x0010
-#define FORECAST_SECOND_KUMORI 0x0020
-#define FORECAST_SECOND_AME 0x0040
-#define FORECAST_SECOND_YUKI 0x0080
+#define FORECAST_PARSE_SUCCESS 0
+#define FORECAST_PARSE_ERROR -1
 
-#define FORECAST_CONNECT_ERROR 0x0001
-#define FORECAST_JSON_ERROR 0x0002
+enum class Weather {
+  NONE,
+  HARE,
+  KUMORI,
+  AME,
+  YUKI
+};
 
-#define FORECAST_MASK_FIRST 0xF000
-#define FORECAST_MASK_NOCHI_TOKIDOKI 0x0F00
-#define FORECAST_MASK_SECOND 0x00F0
+enum class WeatherChange {
+  NONE,
+  TOKIDOKI,
+  NOCHI
+};
+
+struct Forecast {
+  Weather first;
+  WeatherChange change;
+  Weather second;
+};
 
 TFT_eSPI tft;
 TFT_eSprite sprite1 = TFT_eSprite(&tft);
-int weather;
+unsigned long lastupdate;
+Forecast forecast;
 
-/*
- * usart_ll_thread_idにアクセスするため、Arduino/libraries/esp-at-lib-develop/src/esp_ll_arduino.cppの
- * 90行目を以下のように変更する(staticを取る)
- * 
- * esp_sys_thread_t usart_ll_thread_id;
- */
-extern esp_sys_thread_t usart_ll_thread_id;
+int parseWeatherStr(const char* telop, Forecast* forecast) {
+  forecast->first = Weather::NONE;
+  forecast->change = WeatherChange::NONE;
+  forecast->second = Weather::NONE;
 
-int parseWeatherStr(const char* telop) {
-  int returncode = FORECAST_NULL;
-  
   // 最初の予報
   char* hare1 = strstr(telop, u8"晴");
   char* kumori1 = strstr(telop, u8"曇");
@@ -77,16 +101,17 @@ int parseWeatherStr(const char* telop) {
   char* yuki1 = strstr(telop, u8"雪");
 
   // 最初の位置に文字列があるか？
-  if(hare1 == telop)         returncode = FORECAST_FIRST_HARE;
-  else if(kumori1 == telop)  returncode = FORECAST_FIRST_KUMORI;
-  else if(ame1 == telop)     returncode = FORECAST_FIRST_AME;
-  else if(yuki1 == telop)    returncode = FORECAST_FIRST_YUKI;
-  
+  if(hare1 == telop)         forecast->first = Weather::HARE;
+  else if(kumori1 == telop)  forecast->first = Weather::KUMORI;
+  else if(ame1 == telop)     forecast->first = Weather::AME;
+  else if(yuki1 == telop)    forecast->first = Weather::YUKI;
+  else return FORECAST_PARSE_ERROR;
   // 時々or のち
   char* tokidoki = strstr(telop, u8"時");
   char* nochi = strstr(telop, u8"の");
-  if(tokidoki != NULL)    returncode |= FORECAST_TOKIDOKI;
-  else if(nochi != NULL)  returncode |= FORECAST_NOCHI;
+  if(tokidoki != NULL)    forecast->change = WeatherChange::TOKIDOKI;
+  else if(nochi != NULL)  forecast->change = WeatherChange::NOCHI;
+  else return FORECAST_PARSE_SUCCESS;
   
   // 次の予報 検索位置をずらして再検索
   char* hare2 = strstr(telop + 1, u8"晴");
@@ -94,36 +119,45 @@ int parseWeatherStr(const char* telop) {
   char* ame2 = strstr(telop + 1, u8"雨");
   char* yuki2 = strstr(telop + 1, u8"雪");
   
-  if(hare2 != NULL)         returncode |= FORECAST_SECOND_HARE;
-  else if(kumori2 != NULL)  returncode |= FORECAST_SECOND_KUMORI;
-  else if(ame2 != NULL)     returncode |= FORECAST_SECOND_AME;
-  else if(yuki2 != NULL)    returncode |= FORECAST_SECOND_YUKI;
-
-  return returncode;
+  if(hare2 != NULL)         forecast->second = Weather::HARE;
+  else if(kumori2 != NULL)  forecast->second = Weather::KUMORI;
+  else if(ame2 != NULL)     forecast->second = Weather::AME;
+  else if(yuki2 != NULL)    forecast->second = Weather::YUKI;
+  else return FORECAST_PARSE_ERROR;
+  
+  return FORECAST_PARSE_SUCCESS;
 }
 
-int getWeather() {
-  int returncode = FORECAST_NULL;
-  
+int getWeather(Forecast* forecast) {
+  int returncode = WEATHER_SUCCESS;
   WiFiClient client;
   StaticJsonDocument<64> filter;
   StaticJsonDocument<512> doc;
   DeserializationError error;
+  int parseerror;
+  unsigned long starttime;
 
   tft.setCursor(0, 0);
   tft.println("Begin WiFi");
-  vTaskPrioritySet(usart_ll_thread_id, ESP_SYS_THREAD_PRIO - 1);
   
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  while (WiFi.status() != WL_CONNECTED) {
+  starttime = millis();
+  while ((WiFi.status() != WL_CONNECTED) && (millis() - starttime < AP_TIMEOUT)) {
       delay(100);
   }
+  // AP接続タイムアウト
+  if(millis() - starttime >= AP_TIMEOUT) {
+    returncode = WEATHER_AP_ERROR;
+    goto EXIT;
+  }
+
   tft.println("Connect " API_SERVER);
-  
+
+  client.setTimeout(CLIENT_TIMEOUT);
   if (!client.connect(API_SERVER, 80)) {
       tft.println("Connection failed!");
-      returncode = FORECAST_CONNECT_ERROR;
+      returncode = WEATHER_CONNECTION_ERROR;
       goto EXIT;
   }
 
@@ -131,17 +165,23 @@ int getWeather() {
   // Make a HTTP request:
   client.println("GET " API_RESOURCE " HTTP/1.0");
   client.println("Host: " API_SERVER);
-  client.println("Connection: close");
+  client.println("User-Agent: WioTerminal/1.0");
   client.println();
 
   tft.println("Connected");
-  while (client.connected()) {
+  // ヘッダを飛ばす
+  starttime = millis();;
+  while (client.connected() && (millis() - starttime < HTTP_HEADER_TIMEOUT)) {
     delay(1);
     String line = client.readStringUntil('\n');
     if (line == "\r") {
-      // end of header
       break;
     }
+  }
+  // ヘッダタイムアウト
+  if(millis() - starttime >= HTTP_HEADER_TIMEOUT) {
+      returncode = WEATHER_TIMEOUT;
+      goto EXIT;
   }
   tft.println("Header end");
 
@@ -155,31 +195,32 @@ int getWeather() {
   if (error) {
     tft.print("deserializeJson() failed: ");
     tft.println(error.c_str());
-    returncode = FORECAST_JSON_ERROR;
+    returncode = WEATHER_JSON_ERROR;
     goto EXIT;
   }
   
   // 予報文字列をパース
-  returncode = parseWeatherStr(doc["forecasts"][1]["telop"]);
-  
+  if(parseWeatherStr(doc["forecasts"][1]["telop"], forecast) 
+          != FORECAST_PARSE_SUCCESS) {
+    returncode = WEATHER_PARSE_ERROR;
+    goto EXIT;
+  }
+
 EXIT:
   client.stop();
   WiFi.disconnect();
-  
-  vTaskPrioritySet(usart_ll_thread_id, ESP_SYS_THREAD_PRIO - 2);
-  
-  tft.println(returncode, HEX);  
   return returncode;
 }
 
-void drawImage(const uint8_t image[][5]){
-  int x = 0;
-
-  sprite1.createSprite(320, 240);
+void drawImage(const uint8_t image[GRAPHIC_HEIGHT][GRAPHIC_WIDTH]){
+  // 描画中だけWiFi通信スレッドの優先順位を変更する
+  WIFI_THREAD_LOW_PRIORITY();
   
-  for(int y=0; y < 28; y++){
+  sprite1.createSprite(320, 240);
+  int x = 0;
+  for(int y=0; y < GRAPHIC_HEIGHT; y++){
     x = 0;
-    for(int x_byte=0; x_byte < 5; x_byte++){
+    for(int x_byte=0; x_byte < GRAPHIC_WIDTH; x_byte++){
       for(uint8_t x_bit=0x80; x_bit > 0; x_bit >>= 1){
         if((image[y][x_byte] & x_bit) != 0){
           sprite1.fillCircle(OFFSET_X + x * CIRCLE_OFFSET , OFFSET_Y + y * CIRCLE_OFFSET, CIRCLE_RADIUS, TFT_WHITE);
@@ -188,45 +229,59 @@ void drawImage(const uint8_t image[][5]){
       }
     }
   }
-  
+
   sprite1.pushSprite(0, 0);
   sprite1.deleteSprite();
+  
+  WIFI_THREAD_RESTORE_PRIOTIRY();
 }
 
-void drawWeather(int weather){
-  switch(weather){
-    case FORECAST_FIRST_HARE:
+
+void drawWeather(Weather weather) {
+  switch(weather) {
+    case Weather::HARE:
       drawImage(WEATHER_HARE);
       break;
-    case FORECAST_FIRST_KUMORI:
+    case Weather::KUMORI:
       drawImage(WEATHER_KUMORI);
       break;
-    case FORECAST_FIRST_AME:
+    case Weather::AME:
       drawImage(WEATHER_AME);
       break;
-    case FORECAST_FIRST_YUKI:
+    case Weather::YUKI:
       drawImage(WEATHER_YUKI);
       break;
-    case FORECAST_SECOND_HARE:
-      drawImage(WEATHER_HARE);
-      break;
-    case FORECAST_SECOND_KUMORI:
-      drawImage(WEATHER_KUMORI);
-      break;
-    case FORECAST_SECOND_AME:
-      drawImage(WEATHER_AME);
-      break;
-    case FORECAST_SECOND_YUKI:
-      drawImage(WEATHER_YUKI);
-      break;
-     case FORECAST_TOKIDOKI:
+  }
+}
+
+
+void drawWeather(WeatherChange change) {
+  switch(change) {
+     case WeatherChange::TOKIDOKI:
       drawImage(WEATHER_TOKIDOKI);
       break;
-     case FORECAST_NOCHI:
+     case WeatherChange::NOCHI:
       drawImage(WEATHER_NOCHI);
       break;
   }
 }
+
+
+void updateWeather(bool forceupdate=false) {
+  if ((millis() - lastupdate) > UPDATE_PERIOD_MS || forceupdate) {
+    drawImage(WEATHER_UPDATING);
+    
+    for(int i=0; i < UPDATE_RETRY; i++) {
+      int error = getWeather(&forecast);
+      if(error == WEATHER_SUCCESS) {
+        lastupdate = millis();
+        break;
+      }
+      delay(3000);
+    }
+  }
+}
+
 
 void setup() {
   tft.begin();
@@ -235,28 +290,33 @@ void setup() {
   sprite1.setColorDepth(1);
   tft.setBitmapColor(TFT_LAMP, TFT_BLACK);
   tft.fillScreen(TFT_BLACK);
-  
-  //weather = getWeather();
-  //weather = FORECAST_FIRST_HARE | FORECAST_NOCHI | FORECAST_SECOND_KUMORI;
+
+  updateWeather(true);
 }
 
+
 void loop() {
-  weather = getWeather();
-  for(int i=0;i<10;i++){
-  drawImage(WEATHER_ASUNOTENKI);
-  delay(1500);
+  updateWeather();
 
-  drawWeather(weather & FORECAST_MASK_FIRST);
-  delay(1500);
-
-  if(weather & FORECAST_MASK_NOCHI_TOKIDOKI) {
-    drawWeather(weather & FORECAST_MASK_NOCHI_TOKIDOKI);
-    delay(1000);
-  }
-  
-  if(weather & FORECAST_MASK_SECOND) {
-    drawWeather(weather & FORECAST_MASK_SECOND);
+  if(forecast.first != Weather::NONE) {
+    drawImage(WEATHER_ASUNOTENKI);
     delay(1500);
+  
+    drawWeather(forecast.first);
+    delay(1500);
+  
+    if(forecast.change != WeatherChange::NONE) {
+      drawWeather(forecast.change);
+      delay(1000);
+    }
+    
+    if(forecast.second != Weather::NONE) {
+      drawWeather(forecast.second);
+      delay(1500);
+    }
   }
+  else {
+    drawImage(WEATHER_ERROR);
+    delay(UPDATE_PERIOD_MS);
   }
 }
