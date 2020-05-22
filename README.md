@@ -1,7 +1,8 @@
 # WioTerminal-WeatherSign
 WioTerminalで相鉄の駅にあった電光掲示板を再現するスケッチ
 
-https://twitter.com/103yen/status/1261860567997755392
+説明
+http://y99.hateblo.jp/entry/2020/05/22/211736
 
 # 使用ライブラリ
 次のライブラリをインストールしてください。
