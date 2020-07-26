@@ -1,14 +1,11 @@
 /*
  * WioTerminal WeatherSign
- * 2020/5/22 @103yen
+ * 2020/7/26 @103yen
  */
 
 #include <string.h>
 #include <TFT_eSPI.h>
-#include <AtWiFi.h>
-
-#define ARDUINOJSON_DECODE_UNICODE 1
-#include <ArduinoJson.h>
+#include <WiFiClientSecure.h>
 
 #include "weather_graphic.h"
 
@@ -24,12 +21,37 @@ extern esp_sys_thread_t usart_ll_thread_id;
 #define WIFI_SSID "SSID"
 #define WIFI_PASSWORD "PASSWORD"
 
-// Livedoor天気情報API
-// 解説 http://weather.livedoor.com/weather_hacks/webservice
-// city=以降が地域ID
-// ID一覧 http://weather.livedoor.com/forecast/rss/primary_area.xml
-#define API_RESOURCE "/forecast/webservice/json/v1?city=130010"
-#define API_SERVER "weather.livedoor.com"
+// Yahoo!天気・災害
+// https://weather.yahoo.co.jp/weather/rss/
+#define API_RESOURCE "/rss/days/4410.xml"
+#define API_SERVER "rss-weather.yahoo.co.jp"
+
+// XMLに出てくる<description>タグのうち、先頭から何番目のものが目的の天気予報か
+#define API_DESCRIPTION_LEVEL 3
+
+// Baltimore CyberTrust Root
+const char* cybertrust_root_ca = 
+R"(-----BEGIN CERTIFICATE-----
+MIIDdzCCAl+gAwIBAgIEAgAAuTANBgkqhkiG9w0BAQUFADBaMQswCQYDVQQGEwJJ
+RTESMBAGA1UEChMJQmFsdGltb3JlMRMwEQYDVQQLEwpDeWJlclRydXN0MSIwIAYD
+VQQDExlCYWx0aW1vcmUgQ3liZXJUcnVzdCBSb290MB4XDTAwMDUxMjE4NDYwMFoX
+DTI1MDUxMjIzNTkwMFowWjELMAkGA1UEBhMCSUUxEjAQBgNVBAoTCUJhbHRpbW9y
+ZTETMBEGA1UECxMKQ3liZXJUcnVzdDEiMCAGA1UEAxMZQmFsdGltb3JlIEN5YmVy
+VHJ1c3QgUm9vdDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAKMEuyKr
+mD1X6CZymrV51Cni4eiVgLGw41uOKymaZN+hXe2wCQVt2yguzmKiYv60iNoS6zjr
+IZ3AQSsBUnuId9Mcj8e6uYi1agnnc+gRQKfRzMpijS3ljwumUNKoUMMo6vWrJYeK
+mpYcqWe4PwzV9/lSEy/CG9VwcPCPwBLKBsua4dnKM3p31vjsufFoREJIE9LAwqSu
+XmD+tqYF/LTdB1kC1FkYmGP1pWPgkAx9XbIGevOF6uvUA65ehD5f/xXtabz5OTZy
+dc93Uk3zyZAsuT3lySNTPx8kmCFcB5kpvcY67Oduhjprl3RjM71oGDHweI12v/ye
+jl0qhqdNkNwnGjkCAwEAAaNFMEMwHQYDVR0OBBYEFOWdWTCCR1jMrPoIVDaGezq1
+BE3wMBIGA1UdEwEB/wQIMAYBAf8CAQMwDgYDVR0PAQH/BAQDAgEGMA0GCSqGSIb3
+DQEBBQUAA4IBAQCFDF2O5G9RaEIFoN27TyclhAO992T9Ldcw46QQF+vaKSm2eT92
+9hkTI7gQCvlYpNRhcL0EYWoSihfVCr3FvDB81ukMJY2GQE/szKN+OMY3EU/t3Wgx
+jkzSswF07r51XgdIGn9w/xZchMB5hbgF/X++ZRGjD8ACtPhSNzkE1akxehi/oCr0
+Epn3o0WC4zxe9Z2etciefC7IpJ5OCBRLbf1wbWsaY71k5h+3zvDyny67G7fyUIhz
+ksLi4xaNmjICq44Y3ekQEe5+NauQrz4wlHrQMz2nZQ/1/I6eYs9HRCwBXbsdtTLS
+R9I4LtD+gdwyah617jzV/OeBHRnDJELqYzmp
+-----END CERTIFICATE-----)";
 
 // 更新間隔(ms)
 #define UPDATE_PERIOD_MS (1UL * 60 * 60 * 1000)
@@ -39,6 +61,7 @@ extern esp_sys_thread_t usart_ll_thread_id;
 #define CLIENT_TIMEOUT 10000
 #define AP_TIMEOUT 20000
 #define HTTP_HEADER_TIMEOUT 10000
+#define HTTP_CONTENTS_TIMEOUT 10000
 
 // 描画位置
 #define OFFSET_X 25
@@ -84,6 +107,7 @@ struct Forecast {
   Weather second;
 };
 
+WiFiClientSecure client;
 TFT_eSPI tft;
 TFT_eSprite sprite1 = TFT_eSprite(&tft);
 unsigned long lastupdate;
@@ -130,12 +154,15 @@ int parseWeatherStr(const char* telop, Forecast* forecast) {
 
 int getWeather(Forecast* forecast) {
   int returncode = WEATHER_SUCCESS;
-  WiFiClient client;
-  StaticJsonDocument<64> filter;
-  StaticJsonDocument<512> doc;
-  DeserializationError error;
   int parseerror;
   unsigned long starttime;
+  // XMLパース用
+  bool tag = false;
+  char tagname[32];
+  int tagname_cnt = 0;
+  int description_cnt = 0;
+  char telop[64];
+  int telop_cnt = 0;
 
   tft.setCursor(0, 0);
   tft.println("Begin WiFi");
@@ -155,7 +182,7 @@ int getWeather(Forecast* forecast) {
   tft.println("Connect " API_SERVER);
 
   client.setTimeout(CLIENT_TIMEOUT);
-  if (!client.connect(API_SERVER, 80)) {
+  if (!client.connect(API_SERVER, 443)) {
       tft.println("Connection failed!");
       returncode = WEATHER_CONNECTION_ERROR;
       goto EXIT;
@@ -170,7 +197,7 @@ int getWeather(Forecast* forecast) {
 
   tft.println("Connected");
   // ヘッダを飛ばす
-  starttime = millis();;
+  starttime = millis();
   while (client.connected() && (millis() - starttime < HTTP_HEADER_TIMEOUT)) {
     delay(1);
     String line = client.readStringUntil('\n');
@@ -185,22 +212,54 @@ int getWeather(Forecast* forecast) {
   }
   tft.println("Header end");
 
-  // JSONのうち残す項目
-  filter["forecasts"][0]["dateLabel"] = true;
-  filter["forecasts"][0]["telop"] = true;
-  filter["forecasts"][0]["date"] = true;
-  filter["publicTime"] = true;
+  // パケットを受信しながらXMLをパース
+  // <description>タグを階層によらずにチェックするだけ
+  starttime = millis();
+  while ((millis() - starttime < HTTP_CONTENTS_TIMEOUT)) {
+    if (client.available()) {
+      int c = client.read();
 
-  error = deserializeJson(doc, client, DeserializationOption::Filter(filter));
-  if (error) {
-    tft.print("deserializeJson() failed: ");
-    tft.println(error.c_str());
-    returncode = WEATHER_JSON_ERROR;
-    goto EXIT;
+      if (c == '<') {
+        // タグ開始
+        tag = true;
+        // <description>タグの終わり
+        if (description_cnt == API_DESCRIPTION_LEVEL){
+          telop[telop_cnt++] = '\0';
+          break;
+        }
+        telop_cnt = 0;
+      }
+      else if (c == '>') {
+        // タグ終了
+        // タグは<description>タグか？
+        if (strstr(tagname, "description") == tagname) {
+          description_cnt++;
+        }
+        tag = false;
+        tagname_cnt = 0;
+      }
+      else if(tag) {
+        // タグ名を溜め込む
+        tagname[tagname_cnt++] = c;
+      }
+      else if (description_cnt == API_DESCRIPTION_LEVEL) {
+        // <description>タグ中なら文字列を溜め込む
+        telop[telop_cnt++] = c;
+      }
+    }
   }
-  
+  // コンテンツタイムアウト
+  if(millis() - starttime >= HTTP_CONTENTS_TIMEOUT) {
+      returncode = WEATHER_TIMEOUT;
+      goto EXIT;
+  }
+  if (telop_cnt == 0) {
+      returncode = WEATHER_TIMEOUT;
+      goto EXIT;
+  }
+
   // 予報文字列をパース
-  if(parseWeatherStr(doc["forecasts"][1]["telop"], forecast) 
+  if(parseWeatherStr(telop, forecast) 
           != FORECAST_PARSE_SUCCESS) {
     returncode = WEATHER_PARSE_ERROR;
     goto EXIT;
@@ -291,6 +350,7 @@ void setup() {
   tft.setBitmapColor(TFT_LAMP, TFT_BLACK);
   tft.fillScreen(TFT_BLACK);
 
+  client.setCACert(cybertrust_root_ca);
   updateWeather(true);
 }
 
