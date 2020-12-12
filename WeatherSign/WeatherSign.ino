@@ -1,6 +1,7 @@
 /*
  * WioTerminal WeatherSign
  * 2020/7/26 @103yen
+ * 2020/12/12 ルート証明書を更新
  */
 
 #include <string.h>
